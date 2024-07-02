@@ -1368,6 +1368,8 @@ void setup() {
 	printf("%u: Init HomeSpan\n", (uint32_t)millis());
 	#ifndef SKIP_WIFI_CREDENTIALS
 		homeSpan.setWifiCredentials(ssid, sspwd);
+	#else
+		homeSpan.enableAutoStartAP();
 	#endif
 	homeSpan.setSketchVersion(versionString);
 	homeSpan.setWifiCallback(wifiReady);
