@@ -265,8 +265,12 @@ void processPacketQueue() {
 
 		if (lastPacketSendTime >= interval) {
 			if (doCANWrite) {
+#ifndef DISABLE_CAN_BUS_WRITES
 				printf("%u: CAN-Bus Send Packet\n", (uint32_t)millis());
 				ESP32Can.CANWriteFrame(&packetQueue[nextIndex]);
+#else
+				printf("%u: ***DISABLED*** CAN-Bus Send Packet\n", (uint32_t)millis());
+#endif
 			}
 			else {
 				printf("%u: ***SIMULATE*** CAN-Bus Send Packet\n", (uint32_t)millis());
@@ -314,9 +318,9 @@ void sendDCDimmerCmd(uint8_t index, uint8_t brightness, uint8_t cmd, uint8_t dur
 
 	queuePacket(&packet);
 
-	// printf("%u: Queueing Dimmer packet: #%d, bright=%d, cmd=%d, dur=%d\n", (uint32_t)millis(), index, brightness, cmd, duration);
-	// displayPacket(&packet, packetPrintYes);
-	// printf("%u: ** Packet queued.\n", (uint32_t)millis());
+	printf("%u: Queueing Dimmer packet: #%d, bright=%d, cmd=%d, dur=%d\n", (uint32_t)millis(), index, brightness, cmd, duration);
+	displayPacket(&packet, packetPrintYes);
+	printf("%u: ** Packet queued.\n", (uint32_t)millis());
 }
 
 void sendOnOff(uint8_t index, bool on, uint8_t brightness=RVCBrightMax) {

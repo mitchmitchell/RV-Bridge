@@ -31,39 +31,39 @@
 
 // index, type, name
 const SwitchDeviceRec switchList[] = {
-    9401, DimmableLamp, "Living Room",
-    9402, DimmableLamp, "Kitchen Pendant",
-    9404, DimmableLamp, "Kitchen Accent",
-    9403, DimmableLamp, "Dinette",
-    9404, DimmableLamp, "Bedroom",
-    9104, DimmableLamp, "Bed Reading",
-    9105, DimmableLamp, "Bed/Bath Accent",
-    9106, DimmableLamp, "Security",
-    9107, DimmableLamp, "Awning 1 & Step",
-    9108, DimmableLamp, "Awning 2",
-    9109, Lamp, "Rear Accent",
+    252, DimmableLamp, "Living Room",
+    251, DimmableLamp, "Kitchen Pendant",
+    250, DimmableLamp, "Kitchen Accent",
+    249, DimmableLamp, "Dinette",
+    248, DimmableLamp, "Bedroom",
+    247, DimmableLamp, "Bed Reading",
+    246, DimmableLamp, "Bed/Bath Accent",
+    245, DimmableLamp, "Security",
+    244, DimmableLamp, "Awning 1 & Step",
+    243, DimmableLamp, "Awning 2",
+    242, Lamp, "Rear Accent",
 
-    9023, Switch, "Water Pump",
-    9000, Switch, "Gas Water Heater",
-    9001, Switch, "Electric Water Heater",
-    9002, Switch, "Tank Heaters"
+    241, Switch, "Water Pump",
+    240, Switch, "Gas Water Heater",
+    239, Switch, "Electric Water Heater",
+    238, Switch, "Tank Heaters"
 };
 
 // index, upIndex[or -1], downIndex[or -1], name
 const FanDeviceRec fanList[] = {
-    // 9421, -1, -1, "Bathroom" // not used with optional third AC
+    // 237, -1, -1, "Bathroom" // not used with optional third AC
 };
 
 // coolingInstance, compressorIndex, fanHIndex, fanLIndex, furnaceInstance[or -1], combustionIndex[or -1], name
 const ThermostatDeviceRec thermostatList[] = {
-    9000, 9025, 9026, 9027, 9552, 9533, "Main",
-    9101, 9229, 9230, 9231, -1, -1, "Second AC",
-    9103, 9029, 9030, 9031, -1, -1, "Third AC"
+    236, 235, 234, 233, 232, 231, "Main",
+    230, 229, 228, 227, -1, -1, "Second AC",
+    226, 225, 224, 223, -1, -1, "Third AC"
 };
 
 // extendIndex, retractIndex, extendTime, retractTime, name
 #define HAVE_AWNINGS
 const AwningDeviceRec awningList[] = {
-    9005, 9006, 1000, 1000, "Awning 1",
-    9003, 9004, 1000, 1000, "Awning 2"
+    222, 221, 1000, 1000, "Awning 1",
+    220, 219, 1000, 1000, "Awning 2"
 };
