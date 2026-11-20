@@ -41,4 +41,10 @@ constexpr uint8_t sourceAddress = 145;
 // uncomment to create battery devices for House and Chassis batteries
 #define CREATE_BATTERIES
 
+// Give every accessory a HomeKit id derived from its instance number, so that adding, removing
+// or reordering lines in the device lists does not make HomeKit forget rooms and automations.
+// Turning this on for a bridge that is already paired renumbers its accessories once: they
+// will need to be put back into their rooms a single time.
+#define STABLE_ACCESSORY_IDS
+
 #include "RV/Miramar_2020_3202.h"
