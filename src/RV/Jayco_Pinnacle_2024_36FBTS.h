@@ -26,6 +26,17 @@
  ********************************************************************************/
  
 // Device definitions for a 2024 Jayco Pinnacle 36FBTS
+//
+// *** UNVERIFIED ***
+// The names below are right but the instance numbers (252 counting down) are placeholders.
+// The Pinnacle uses the BMPRO "JAYCOMMAND" system, not Firefly, and nobody has published its
+// RV-C instance map. Follow docs/DISCOVERY.md to find the real numbers, replace the
+// placeholders, then delete the RV_DEFINITION_UNVERIFIED line.
+//
+// While RV_DEFINITION_UNVERIFIED is defined the bridge starts with CAN-Bus writes switched off,
+// so a wrong number cannot operate a slide, jack, awning or the generator by accident.
+
+#define RV_DEFINITION_UNVERIFIED
 
 #include "devices.h"
 

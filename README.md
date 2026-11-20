@@ -157,6 +157,10 @@ The whole multiplex system connects back to a panel with outputs for all of the 
 
 *** ***USE EXTREME CAUTION WHEN ENTERING OUTPUT NUMBERS. THERE ARE OUTPUTS FOR THE RV SLIDES AND THINGS LIKE MOVEABLE BUNKS. YOU DO NOT WANT TO MISTAKENLY PICK ONE OF THOSE OUTPUTS FOR A LIGHT OR FAN!*** ***
 
+If your coach does not show its output numbers anywhere (for example a coach that does not use a Firefly panel), RV-Bridge can find them by listening to the bus while you operate things from the coach's own controls. See [docs/DISCOVERY.md](/docs/DISCOVERY.md) for the procedure and the serial commands (`@c`, `@m`, `@i`) that support it.
+
+A definition file whose numbers have not been checked on a real coach should contain `#define RV_DEFINITION_UNVERIFIED`. The bridge then starts with CAN-Bus writes switched off until `@w 1` is typed.
+
 ---
 ## <a name="rvs"></a>Supported RV's
 
@@ -165,7 +169,8 @@ Currently the project includes definition files for these RVs in the `RV` folder
 [Miramar_2020_3202.h](/src/RV/Miramar_2020_3202.h) - 2020 Thor Miramar 32.2<br>
 [Aria_2019_3901.h](/src/RV/Aria_2019_3901.h) - 2019 Thor Aria 39.1<br>
 [Tiffin_2019_34PA.h](/src/RV/Tiffin_2019_34PA.h) - 2019 Tiffin Open Road 34PA<br>
-[Jayco_2023_Terrain.h](/src/RV/Jayco_2023_Terrain.h) - 2023 Jayco Terrain 19Y
+[Jayco_2023_Terrain.h](/src/RV/Jayco_2023_Terrain.h) - 2023 Jayco Terrain 19Y<br>
+[Jayco_Pinnacle_2024_36FBTS.h](/src/RV/Jayco_Pinnacle_2024_36FBTS.h) - 2024 Jayco Pinnacle 36FBTS (**unverified**: placeholder numbers, see [docs/DISCOVERY.md](/docs/DISCOVERY.md))
 
 (Additional definition files are welcome!)
 

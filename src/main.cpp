@@ -33,6 +33,9 @@
 
 #include "Arduino.h"
 
+#include <algorithm>
+#include <vector>
+
 #include "elapsedMillis.h"
 #include "HomeSpan.h" 
 #include "ESP32CAN.h"
@@ -42,7 +45,7 @@
 
 //////////////////////////////////////////////
 
-constexpr const char* versionString = "v1.0.0";
+constexpr const char* versionString = "v1.1.0";
 
 constexpr uint8_t indicatorPinR = 2;
 constexpr uint8_t indicatorPinG = 15;
@@ -51,7 +54,10 @@ constexpr uint8_t indicatorPinB = 4;
 constexpr gpio_num_t canTxPin = GPIO_NUM_25;
 constexpr gpio_num_t canRxPin = GPIO_NUM_26;
 
-constexpr uint16_t receiveQueueSize = 10;
+// A busy RV-C bus carries a few hundred frames per second and homeSpan.poll() can take
+// several milliseconds, so the receive queue needs real headroom or status frames get dropped.
+constexpr uint16_t receiveQueueSize = 64;
+constexpr uint16_t maxPacketsPerLoop = 32;
 constexpr uint16_t sendQueueSize = 8;
 
 constexpr uint32_t sendPacketIntervalmS = 50;
@@ -88,8 +94,10 @@ constexpr uint32_t THERMOSTAT_AMBIENT_STATUS = 0x1FF9C;
 constexpr uint32_t THERMOSTAT_STATUS_1 = 0x1FFE2;
 constexpr uint32_t THERMOSTAT_COMMAND_1 = 0x1FEF9;
 
-constexpr uint32_t AIR_CONDITIONER_STATUS = 0x1FFE0; // 1FFE1
+constexpr uint32_t AIR_CONDITIONER_STATUS = 0x1FFE1;
+constexpr uint32_t AIR_CONDITIONER_COMMAND = 0x1FFE0;
 constexpr uint32_t GENERIC_INDICATOR_COMMAND = 0x1FED9;
+constexpr uint32_t GENERIC_INDICATOR_STATUS = 0x1FED7;
 constexpr uint32_t GENERIC_CONFIGURATION_STATUS = 0x1FED8;
 constexpr uint32_t DC_SOURCE_STATUS_1 = 0x1FFFD;
 constexpr uint32_t TANK_STATUS = 0x1FFB7;
@@ -99,7 +107,7 @@ constexpr uint32_t FURNACE_STATUS = 0x1FFE4;
 constexpr uint32_t FURNACE_COMMAND = 0x1FFE3;
 
 constexpr uint32_t INVERTER_TEMPERATURE_STATUS = 0x1FEBD;	
-constexpr uint32_t DC_LOAD_STATUS_2 = 0x1FED;
+constexpr uint32_t DC_LOAD_STATUS_2 = 0x1FEDC;
 constexpr uint32_t ATS_AC_STATUS_4 = 0x1FF85;
 constexpr uint32_t ATS_STATUS = 0x1FFAA;	
 constexpr uint32_t ATS_AC_STATUS_3 = 0x1FFAB;
@@ -115,7 +123,28 @@ constexpr uint32_t AWNING_STATUS = 0x1FEF3;
 constexpr uint32_t AWNING_COMMAND = 0x1FEF2;
 constexpr uint32_t AWNING_STATUS_2 = 0x1FDCD;
 
-constexpr uint32_t BATTERY_STATUS = 0x1AAFD;
+constexpr uint32_t BATTERY_STATUS = 0x1AAFD;		// not a standard RV-C DGN (kept from upstream); DC_SOURCE_STATUS_1 is the standard one
+
+constexpr uint32_t THERMOSTAT_STATUS_2 = 0x1FEFA;
+constexpr uint32_t THERMOSTAT_COMMAND_2 = 0x1FEF8;
+constexpr uint32_t WATERHEATER_STATUS = 0x1FFF7;
+constexpr uint32_t WATERHEATER_COMMAND = 0x1FFF6;
+constexpr uint32_t WATER_PUMP_STATUS = 0x1FFB3;
+constexpr uint32_t WATER_PUMP_COMMAND = 0x1FFB2;
+constexpr uint32_t SLIDE_STATUS = 0x1FFE8;
+constexpr uint32_t SLIDE_COMMAND = 0x1FFE7;
+constexpr uint32_t LEVELING_CONTROL_COMMAND = 0x1FFEE;
+constexpr uint32_t LEVELING_CONTROL_STATUS = 0x1FFED;
+constexpr uint32_t GENERATOR_COMMAND = 0x1FFDA;
+constexpr uint32_t DM_RV = 0x1FECA;
+
+// PDU1-format messages: the low byte of the DGN is the destination address
+constexpr uint32_t ACKNOWLEDGMENT = 0x0E800;
+constexpr uint32_t REQUEST_FOR_DGN = 0x0EA00;
+constexpr uint32_t TP_DATA_PACKET = 0x0EB00;
+constexpr uint32_t TP_INITIAL_PACKET = 0x0EC00;
+constexpr uint32_t ADDRESS_CLAIMED = 0x0EE00;
+constexpr uint32_t PRODUCT_ID = 0x0FEEB;
 
 //////////////////////////////////////////////
 
@@ -127,14 +156,14 @@ typedef enum {
 	DCDimmerCmdStop,
 	DCDimmerCmdToggle,
 	DCDimmerCmdMemoryOff,
-	DCDimmerCmdRampBrightness,
+	DCDimmerCmdRampBrightness = 17,
 	DCDimmerCmdRampToggle,
 	DCDimmerCmdRampUp,
 	DCDimmerCmdRampDown,
 	DCDimmerCmdRampUpDown,
-	DCDimmerCmdLock,
+	DCDimmerCmdLock = 33,
 	DCDimmerCmdUnlock,
-	DCDimmerCmdFlash,
+	DCDimmerCmdFlash = 49,
 	DCDimmerCmdFlashMomentarily,
 
 	DCDimmerCmdNA = 255
@@ -147,7 +176,9 @@ typedef enum {
 	ACModeNA = 3
 } ACMode;
 
-typedef enum {
+// Fixed underlying types: these are cast straight from bit fields in received packets, and a
+// value outside the named range would otherwise be undefined behaviour.
+typedef enum : uint8_t {
 	ThermostatModeOff = 0,
 	ThermostatModeCool,
 	ThermostatModeHeat,
@@ -159,18 +190,18 @@ typedef enum {
 	ThermostatModeNA = 7
 } ThermostatMode;
 
-typedef enum {
+typedef enum : uint8_t {
 	FanModeAuto = 0,
 	FanModeOn,
 
 	FanModeNA = 3
 } FanMode;
 
-constexpr double TempC_NA = 1775.0;
-
+// RV-C percentages are sent in 0.5% steps, so 200 = 100%. 251-255 are "error"/"not available" codes.
 constexpr uint8_t RVCPercentMax = 250;
 constexpr uint8_t RVCBrightMax = 200;
 constexpr uint8_t RVCFanMax = 200;
+constexpr uint8_t RVCInstanceMax = 250;
 constexpr uint8_t HomeKitPercentMax = 100;
 
 //////////////////////////////////////////////
@@ -199,7 +230,7 @@ constexpr uint16_t shadeStateClosed = 2;
 constexpr uint16_t shadeStateClosing = 1 << 3;
 constexpr uint16_t shadeStateOpening = 1 << 4;
 
-constexpr uint16_t shadeStateUserAction = 1 < 5;
+constexpr uint16_t shadeStateUserAction = 1 << 5;
 constexpr uint16_t shadeStateLocalAction = 1 << 6;
 constexpr uint16_t shadeStateHomeKitAction = 1 << 7;
 
@@ -231,7 +262,13 @@ uint32_t makeMsg(uint32_t dgn, uint8_t sourceID=0, uint8_t priority=6) {
 		sourceID = sourceAddress;
 	}
 
-	return (priority<<26) | (dgn << 8) | sourceID;	
+	return ((uint32_t)priority<<26) | (dgn << 8) | sourceID;	
+}
+
+// For PDU1-format messages (DGN-high below 0xF0) the low byte is a destination address,
+// not part of the DGN. Strip it so those messages can be compared against a constant.
+uint32_t dgnBase(uint32_t dgn) {
+	return (((dgn >> 8) & 0xFF) < 0xF0) ? (dgn & 0x1FF00) : dgn;
 }
 
 //////////////////////////////////////////////
@@ -242,7 +279,11 @@ constexpr double tempCScaleInv = 1.0 / tempCScale;
 // constexpr double tempCRoundingOffset = 0.25;
 constexpr double tempCRoundingOffset = -0.25;
 
+// Returns NAN for the RV-C "not available"/"error"/"reserved" codes (0xFFFD-0xFFFF)
 double convToTempC(uint16_t value) {
+	if (value >= 0xFFFD) {
+		return NAN;
+	}
 	return tempCOffset + value * tempCScale + tempCRoundingOffset;
 }
 
@@ -256,7 +297,15 @@ CAN_frame_t packetQueue[sendQueueSize];
 bool packetShortGap[sendQueueSize];
 uint16_t packetQueueHead = 0;
 uint16_t packetQueueTail = 0;
+
+// A definition file whose instance numbers have not been confirmed on a real coach defines
+// RV_DEFINITION_UNVERIFIED. Writes then start out disabled ("@w 1" turns them on) so a guessed
+// instance number can never operate the wrong load.
+#ifdef RV_DEFINITION_UNVERIFIED
+bool doCANWrite = false;
+#else
 bool doCANWrite = true;
+#endif
 
 void processPacketQueue() {
 	if (packetQueueHead != packetQueueTail) {
@@ -344,7 +393,8 @@ void sendThermostatCommand(uint8_t index, ThermostatMode mode, FanMode fanMode, 
 	initPacket(&packet, index, THERMOSTAT_COMMAND_1);
 	uint8_t* d = packet.data.u8;
 
-	d[1] = mode | (fanMode << 4);
+	// bits 6-7 are the schedule mode: 11b = "no change" (00b would switch the schedule off)
+	d[1] = (mode & 0x0F) | ((fanMode & 0x03) << 4) | 0xC0;
 	d[2] = fanSpeed;
 
 	uint16_t tempVal = convFromTempC(tempC);
@@ -548,14 +598,22 @@ struct RVHVACFan : Service::Fan {
 		return(true);  
 	}
 
-	void setModeSpeed(FanMode fanMode, uint8_t speed) {
+	void setModeSpeed(FanMode fanMode, uint8_t rvcSpeed) {
 		bool newActive = fanMode == FanModeOn;
-		speed = speed * HomeKitPercentMax / RVCPercentMax;
 
 		if (newActive != _active->getVal()) {
 			printf("%u: RVHVACFan #%d - setActive: %d\n", (uint32_t)millis(), _index, newActive);
 			_active->setVal(newActive);
 		}
+		if (rvcSpeed > RVCPercentMax) {		// "not available" - keep the last known speed
+			return;
+		}
+
+		// Same scale as getModeSpeed() (200 = 100%), snapped to the 50% steps HomeKit was told about
+		constexpr uint8_t speedStep = HomeKitPercentMax / 2;
+		uint8_t percent = min(rvcSpeed, RVCFanMax) * HomeKitPercentMax / RVCFanMax;
+		uint8_t speed = ((percent + speedStep / 2) / speedStep) * speedStep;
+
 		if (speed != _speed->getVal()) {
 			printf("%u: RVHVACFan #%d - setSpeed: %d\n", (uint32_t)millis(), _index, speed);
 			_speed->setVal(speed);
@@ -614,14 +672,25 @@ struct RVThermostat : Service::Thermostat {
 	int16_t _furnaceInstance;
 	int16_t _combustionIndex;
 	ThermostatMode _furnaceMode = ThermostatModeOff;
+	bool _separateFurnace;				// the furnace is a different thermostat instance than cooling
+
+	double _coolSetpoint = NAN;			// cool setpoint reported by the cooling instance
+	double _heatSetpoint = NAN;			// heat setpoint reported by the cooling instance
+	double _furnaceSetpoint = NAN;		// heat setpoint reported by a separate furnace instance
+
+	static constexpr double targetMinC = 10.0;
+	static constexpr double targetMaxC = 32.0;
+	static constexpr double ambientMinC = -40.0;
+	static constexpr double ambientMaxC = 100.0;
 
 	bool _compressorRunning = false;
 	bool _furnaceRunning = false;
 
 	RVThermostat(ThermostatDeviceRec *device) : Service::Thermostat() {
 		_ambientTemp = new Characteristic::CurrentTemperature(20);
+		_ambientTemp->setRange(ambientMinC, ambientMaxC, 0.1);		// the HomeKit default bottoms out at 0ºC
 		_targetTemp = new Characteristic::TargetTemperature();
-		_targetTemp->setRange(10, 32, (1.0 / 1.8))->setVal(20);
+		_targetTemp->setRange(targetMinC, targetMaxC, (1.0 / 1.8))->setVal(20);
 		_currentState = new Characteristic::CurrentHeatingCoolingState(heatingCoolingStateOff);
 		_targetState = new Characteristic::TargetHeatingCoolingState(heatingCoolingStateOff);
 		new Characteristic::TemperatureDisplayUnits(homeKitTemperatureDisplayFahrenheit);
@@ -638,14 +707,17 @@ struct RVThermostat : Service::Thermostat {
 
 		_furnaceInstance = device->furnaceInstance;
 		_combustionIndex = device->combustionIndex;
+		_separateFurnace = _furnaceInstance != -1 && _furnaceInstance != _coolingInstance;
 
 		_fan = new RVHVACFan(device, [this]()->bool { updateThermostat(); return true; });
 	}
 
 	void updateThermostat() {
 		printf("%u: Thermostat #%d: Send thermostat info\n", (uint32_t)millis(), _coolingInstance);
-		ThermostatMode modeLookup[] { ThermostatModeOff, ThermostatModeHeat, ThermostatModeCool };
-		ThermostatMode opMode = modeLookup[_targetState->getNewVal()];
+		const ThermostatMode modeLookup[] { ThermostatModeOff, ThermostatModeHeat, ThermostatModeCool };
+		uint8_t targetState = _targetState->getNewVal();
+		ThermostatMode opMode = (targetState < 3) ? modeLookup[targetState] : ThermostatModeOff;
+		double tempC = _targetTemp->getNewVal<double>();
 		FanMode fanMode;
 		uint8_t speed;
 
@@ -655,18 +727,23 @@ struct RVThermostat : Service::Thermostat {
 			opMode = ThermostatModeFanOnly;
 		}
 
-		if (_furnaceInstance!=-1 && opMode==ThermostatModeHeat) {
+		if (_separateFurnace && opMode==ThermostatModeHeat) {
 			if (_coolingMode != ThermostatModeOff) {
-				sendThermostatCommand(_coolingInstance, ThermostatModeOff, FanModeAuto, 0xFF, _targetTemp->getNewVal<double>());
+				sendThermostatCommand(_coolingInstance, ThermostatModeOff, FanModeAuto, 0xFF, tempC);
 			}
-			sendThermostatCommand(_furnaceInstance, opMode, FanModeAuto, 0xFF, _targetTemp->getNewVal<double>());
+			sendThermostatCommand(_furnaceInstance, opMode, FanModeAuto, 0xFF, tempC);
 		}
 		else {
-			if (_furnaceMode != ThermostatModeOff) {
-				sendThermostatCommand(_furnaceInstance, ThermostatModeOff, FanModeNA, 0xFF, _targetTemp->getNewVal<double>());
+			// Also the path for a coach where one thermostat instance does both heating and cooling
+			if (_separateFurnace && _furnaceMode != ThermostatModeOff) {
+				sendThermostatCommand(_furnaceInstance, ThermostatModeOff, FanModeNA, 0xFF, tempC);
 			}
-			sendThermostatCommand(_coolingInstance, opMode, fanMode, speed, _targetTemp->getNewVal<double>());
+			sendThermostatCommand(_coolingInstance, opMode, fanMode, speed, tempC);
 		}
+	}
+
+	static bool isHeatMode(ThermostatMode mode) {
+		return mode == ThermostatModeHeat || mode == ThermostatModeAuxHeat;
 	}
 
 	boolean update() {
@@ -722,7 +799,12 @@ struct RVThermostat : Service::Thermostat {
 	}
 
 	void setAmbientTemp(uint8_t index, double tempC) {
-		if (index == _coolingInstance && fabs(tempC - _ambientTemp->getVal<double>()) > 0.2) {
+		if (index != _coolingInstance || isnan(tempC)) {
+			return;
+		}
+		tempC = constrain(tempC, ambientMinC, ambientMaxC);
+
+		if (fabs(tempC - _ambientTemp->getVal<double>()) > 0.2) {
 			printf("%u: Set ambient temp #%d: %0.1fºC\n", (uint32_t)millis(), _coolingInstance, tempC);
 			_ambientTemp->setVal(tempC);
 			lastPacketRecvTime = 0;
@@ -730,43 +812,63 @@ struct RVThermostat : Service::Thermostat {
 	}
 
 	void setInfo(uint8_t index, ThermostatMode opMode, FanMode fanMode, uint8_t fanSpeed, double heatTemp, double coolTemp) {
-		bool updateMode = false;
-
 		if (index == _coolingInstance) {
-			if (opMode != _coolingMode) {
-				_coolingMode = opMode;
-				updateMode = true;
+			_coolingMode = opMode;
+			if (!isnan(coolTemp)) {
+				_coolSetpoint = coolTemp;
 			}
-			if (fabs(coolTemp - _targetTemp->getVal<double>()) > 0.2) {
-				printf("%u: Thermostat #%d: targetTemp = %f\n", (uint32_t)millis(), index, coolTemp);
-				_targetTemp->setVal(coolTemp);
-				lastPacketRecvTime = 0;
+			if (!isnan(heatTemp)) {
+				_heatSetpoint = heatTemp;
 			}
 			_fan->setModeSpeed(fanMode, fanSpeed);
 		}
-		else if (index == _furnaceInstance) {
-			if (opMode != _furnaceMode) {
-				_furnaceMode = opMode;
-				updateMode = true;
+		else if (_separateFurnace && index == _furnaceInstance) {
+			_furnaceMode = opMode;
+			if (!isnan(heatTemp)) {
+				_furnaceSetpoint = heatTemp;
+			}
+		}
+		else {
+			return;
+		}
+
+		// Work out the HomeKit target state from what both instances report
+		bool furnaceHeating = _separateFurnace && isHeatMode(_furnaceMode);
+		uint8_t mode = heatingCoolingStateOff;
+
+		if (furnaceHeating) {
+			mode = heatingCoolingStateHeat;
+		}
+		else if (_coolingMode == ThermostatModeCool) {
+			mode = heatingCoolingStateCool;
+		}
+		else if (isHeatMode(_coolingMode) && _furnaceInstance != -1) {	// "Heat" is only a valid HomeKit value when a furnace is defined
+			mode = heatingCoolingStateHeat;
+		}
+
+		if (mode != _targetState->getVal()) {
+			printf("%u: Thermostat #%d: targetState = %d\n", (uint32_t)millis(), index, mode);
+			_targetState->setVal(mode);
+			lastPacketRecvTime = 0;
+		}
+
+		// The target temperature follows the setpoint of whichever side is in use
+		double target = _coolSetpoint;
+
+		if (mode == heatingCoolingStateHeat) {
+			double heatTarget = (furnaceHeating) ? _furnaceSetpoint : _heatSetpoint;
+
+			if (!isnan(heatTarget)) {
+				target = heatTarget;
 			}
 		}
 
-		if (updateMode) {
-			uint8_t mode;
+		if (!isnan(target)) {
+			target = constrain(target, targetMinC, targetMaxC);
 
-			if (_furnaceMode == ThermostatModeHeat) {
-				mode = heatingCoolingStateHeat;
-			}
-			else {
-				uint8_t modeConvert[] { heatingCoolingStateOff, heatingCoolingStateCool, heatingCoolingStateHeat, heatingCoolingStateOff,
-										heatingCoolingStateOff, heatingCoolingStateOff, heatingCoolingStateOff, heatingCoolingStateOff };
-				
-				mode = modeConvert[_coolingMode];
-			}
-
-			if (mode != _targetState->getVal()) {
-				printf("%u: Thermostat #%d: targetState = %d\n", (uint32_t)millis(), index, mode);
-				_targetState->setVal(mode);
+			if (fabs(target - _targetTemp->getVal<double>()) > 0.2) {
+				printf("%u: Thermostat #%d: targetTemp = %f\n", (uint32_t)millis(), index, target);
+				_targetTemp->setVal(target);
 				lastPacketRecvTime = 0;
 			}
 		}
@@ -790,6 +892,8 @@ struct RVBattery : Service::Thermostat {
 	SpanCharacteristic *_currentState;
 
 	int16_t _instance;
+	uint8_t _sourcePriority = 0;
+	uint32_t _sourcePriorityTime = 0;
 
 	RVBattery(int16_t instance) : Service::Thermostat() {
 		_instance = instance;
@@ -812,9 +916,25 @@ struct RVBattery : Service::Thermostat {
 		}
 	}
 
-	void setVoltage(uint8_t index, float voltage) {
-		float voltageAsTemp = tempCfromTempF(voltage * 10.0);
-		if (index == _instance && voltageAsTemp != _ambientTemp->getVal<float>()) {
+	// Several devices can report the same DC source; RV-C says to believe the one with the highest
+	// priority. A lower priority reading is only accepted once the better source has gone quiet.
+	void setVoltage(uint8_t index, float voltage, uint8_t priority=0xFF) {
+		constexpr uint32_t sourceTimeoutMS = 10000;
+		uint32_t now = millis();
+
+		if (index != _instance) {
+			return;
+		}
+		if (priority < _sourcePriority && (now - _sourcePriorityTime) < sourceTimeoutMS) {
+			return;
+		}
+		_sourcePriority = priority;
+		_sourcePriorityTime = now;
+
+		// Displayed as a "temperature" of volts*10 ºF: keep it inside the range HomeKit was given
+		float voltageAsTemp = tempCfromTempF(constrain(voltage * 10.0f, 100.0f, 160.0f));
+
+		if (fabs(voltageAsTemp - _ambientTemp->getVal<float>()) > degCfromDegF(0.4)) {
 			printf("%u: Set voltage #%d: %0.1fV\n", (uint32_t)millis(), _instance, voltage);
 			_ambientTemp->setVal(voltageAsTemp);
 			lastPacketRecvTime = 0;
@@ -827,9 +947,9 @@ uint16_t batteryCount = 0;
 
 RVBattery* batteries[maxBatteries];
 
-void setBatteryVoltage(uint8_t index, float voltage) {
+void setBatteryVoltage(uint8_t index, float voltage, uint8_t priority=0xFF) {
 	for (auto i=0; i<batteryCount; i++) {
-		batteries[i]->setVoltage(index, voltage);
+		batteries[i]->setVoltage(index, voltage, priority);
 	}
 }
 
@@ -845,7 +965,8 @@ struct RVAwning : Service::WindowCovering {
 	float _currentShadePosition = homeKitShadeOpenValue;
 	uint64_t _nextPositionUpdateTime = 0;
 
-	uint64_t _operationEndTime;
+	uint64_t _operationEndTime = 0;
+	uint64_t _lastLoopTime = 0;			// per awning - a function static would be shared by all of them
 
 	uint8_t _retractIndex;
 	uint8_t _extendIndex;
@@ -857,8 +978,8 @@ struct RVAwning : Service::WindowCovering {
 		_targetPosition = new Characteristic::TargetPosition(homeKitShadeOpenValue);
 		_retractIndex = device->retractIndex;
 		_extendIndex = device->extendIndex;
-		_openTimeMS = device->retractTime;
-		_closeTimeMS = device->extendTime;
+		_openTimeMS = max(device->retractTime, (uint32_t)1);		// used as divisors
+		_closeTimeMS = max(device->extendTime, (uint32_t)1);
 	}
 
 	boolean update() {
@@ -867,7 +988,7 @@ struct RVAwning : Service::WindowCovering {
 
 			float targetValue = _targetPosition->getNewVal<float>();
 			float moveAmount = targetValue - _currentShadePosition;
-			uint32_t moveTimeMS = abs(moveAmount / HomeKitPercentMax) * ((moveAmount > 0) ? _openTimeMS : _closeTimeMS);
+			uint32_t moveTimeMS = fabs(moveAmount / HomeKitPercentMax) * ((moveAmount > 0) ? _openTimeMS : _closeTimeMS);
 
 			_operationEndTime = curTime + moveTimeMS;
 
@@ -884,7 +1005,7 @@ struct RVAwning : Service::WindowCovering {
 	}
 
 	void loop() {
-		static uint64_t lastTime = 0;
+		uint64_t &lastTime = _lastLoopTime;
 		uint64_t curTime = millis64();
 
 		if (lastTime == 0) {
@@ -910,11 +1031,15 @@ struct RVAwning : Service::WindowCovering {
 			bool movingOpen = (_shadeState & shadeStateOpening) != 0;
 
 			if (moving) {
-				_currentShadePosition += (curTime - lastTime) * ((movingOpen) ? (HomeKitPercentMax / _openTimeMS) : (HomeKitPercentMax / _closeTimeMS));
+				// percent per millisecond: positive while opening, negative while closing
+				float rate = (movingOpen) ? ((float)HomeKitPercentMax / _openTimeMS) : -((float)HomeKitPercentMax / _closeTimeMS);
+
+				_currentShadePosition += (curTime - lastTime) * rate;
 				_currentShadePosition = max(homeKitShadeClosedValue, min(homeKitShadeOpenValue, _currentShadePosition));
 
 				if (_shadeState & shadeStateHomeKitAction && curTime > _operationEndTime) {
 					_currentShadePosition = _targetPosition->getVal<float>();
+					_currentPosition->setVal(_currentShadePosition);	// otherwise HomeKit shows "opening..." forever
 					_shadeState = 0;
 					printf("%u: Homekit operation complete.\n", (uint32_t)millis());
 				}
@@ -1071,40 +1196,429 @@ void setThermostatInfo(uint8_t index, ThermostatMode opMode, FanMode fanMode, ui
 
 //////////////////////////////////////////////
 
+// HomeKit identifies each accessory by its id (AID). HomeSpan normally numbers them in creation
+// order, so inserting or removing a line in a device list renumbers everything after it and
+// HomeKit loses the room, name and automations of those accessories. With STABLE_ACCESSORY_IDS
+// the id comes from the device's own instance number instead, so the lists can be edited freely.
+constexpr uint32_t aidSwitchBase = 1000;
+constexpr uint32_t aidFanBase = 2000;
+constexpr uint32_t aidThermostatBase = 3000;
+constexpr uint32_t aidAwningBase = 4000;
+constexpr uint32_t aidBatteryBase = 5000;
+constexpr uint32_t aidDuplicateBase = 9000;
+
+void beginAccessory(const char* name, uint32_t base, int16_t index) {
+	uint32_t aid = 0;		// 0 = let HomeSpan number it
+
+#ifdef STABLE_ACCESSORY_IDS
+	static std::vector<uint32_t> usedAIDs;
+	static uint32_t duplicateCount = 0;
+
+	aid = base + (uint16_t)index;
+	if (index < 0 || std::find(usedAIDs.begin(), usedAIDs.end(), aid) != usedAIDs.end()) {
+		printf("%u: *** WARNING: \"%s\" has an invalid or already used instance number (%d) - check the device lists ***\n", (uint32_t)millis(), name, index);
+		aid = aidDuplicateBase + duplicateCount++;
+	}
+	usedAIDs.push_back(aid);
+#endif
+
+	new SpanAccessory(aid);
+		new Service::AccessoryInformation();
+			new Characteristic::Identify();
+			new Characteristic::Name(name);
+}
+
 void createDevices() {
 	SPAN_ACCESSORY();   // create Bridge
 
 		const char* typeNames[] = { "Lamp", "Dimmable", "Switch" };
 		for (SwitchDeviceRec device : switchList) {
 			printf("%u: Creating %s #%d: \"%s\"\n", (uint32_t)millis(), typeNames[device.type], device.index, device.name);
-			SPAN_ACCESSORY(device.name);
+			beginAccessory(device.name, aidSwitchBase, device.index);
 				switches[switchCount++] = new RVSwitch(&device);
 		}
 
 		for (FanDeviceRec fan : fanList) {
 			printf("%u: Creating Fan #%d: \"%s\"\n", (uint32_t)millis(), fan.index, fan.name);
-			SPAN_ACCESSORY(fan.name);
+			beginAccessory(fan.name, aidFanBase, fan.index);
 				fans[fanCount++] = new RVRoofFan(&fan);
 		}
 
 		for (ThermostatDeviceRec thermostat : thermostatList) {
 			printf("%u: Creating Thermostat #%d: \"%s\"\n", (uint32_t)millis(), thermostat.coolingInstance, thermostat.name);
-			SPAN_ACCESSORY(thermostat.name);
+			beginAccessory(thermostat.name, aidThermostatBase, thermostat.coolingInstance);
 				thermostats[thermostatCount++] = new RVThermostat(&thermostat);
 		}
 
 		for (AwningDeviceRec awning : awningList) {
 			printf("%u: Creating Awning \"%s\"\n", (uint32_t)millis(), awning.name);
-			SPAN_ACCESSORY(awning.name);
+			beginAccessory(awning.name, aidAwningBase, awning.extendIndex);
 				awnings[awningCount++] = new RVAwning(&awning);
 		}
 
 		#ifdef CREATE_BATTERIES
-		SPAN_ACCESSORY("House - V*10");
+		beginAccessory("House - V*10", aidBatteryBase, 1);
 			batteries[batteryCount++] = new RVBattery(1);
-		SPAN_ACCESSORY("Chassis - V*10");
+		beginAccessory("Chassis - V*10", aidBatteryBase, 2);
 			batteries[batteryCount++] = new RVBattery(2);
 		#endif
+}
+
+//////////////////////////////////////////////
+// Bus census: a table of every DGN / source address / instance seen on the bus, plus a
+// monitor that reports changes as they happen. This is how the instance numbers of a new
+// coach are discovered - see docs/DISCOVERY.md.
+
+typedef enum {
+	dgnKindStatus = 0,		// periodic data (voltages, tanks, time, ...)
+	dgnKindControl,			// status of something a person switches: reported when it changes
+	dgnKindCommand			// a command from a panel/app: every one is reported
+} DGNKind;
+
+typedef struct {
+	uint32_t dgn;
+	const char* name;
+	DGNKind kind;
+} DGNInfo;
+
+const DGNInfo dgnInfoList[] = {
+	{ DC_DIMMER_STATUS_3, "DC_DIMMER_STATUS_3", dgnKindControl },
+	{ DC_DIMMER_COMMAND_2, "DC_DIMMER_COMMAND_2", dgnKindCommand },
+	{ DC_LOAD_STATUS, "DC_LOAD_STATUS", dgnKindControl },
+	{ DC_LOAD_STATUS_2, "DC_LOAD_STATUS_2", dgnKindControl },
+	{ DC_LOAD_COMMAND, "DC_LOAD_COMMAND", dgnKindCommand },
+	{ AC_LOAD_STATUS, "AC_LOAD_STATUS", dgnKindControl },
+	{ GENERIC_INDICATOR_STATUS, "GENERIC_INDICATOR_STATUS", dgnKindControl },
+	{ GENERIC_INDICATOR_COMMAND, "GENERIC_INDICATOR_COMMAND", dgnKindCommand },
+	{ THERMOSTAT_STATUS_1, "THERMOSTAT_STATUS_1", dgnKindControl },
+	{ THERMOSTAT_STATUS_2, "THERMOSTAT_STATUS_2", dgnKindControl },
+	{ THERMOSTAT_COMMAND_1, "THERMOSTAT_COMMAND_1", dgnKindCommand },
+	{ THERMOSTAT_COMMAND_2, "THERMOSTAT_COMMAND_2", dgnKindCommand },
+	{ THERMOSTAT_AMBIENT_STATUS, "THERMOSTAT_AMBIENT_STATUS", dgnKindStatus },
+	{ AIR_CONDITIONER_STATUS, "AIR_CONDITIONER_STATUS", dgnKindControl },
+	{ AIR_CONDITIONER_COMMAND, "AIR_CONDITIONER_COMMAND", dgnKindCommand },
+	{ FURNACE_STATUS, "FURNACE_STATUS", dgnKindControl },
+	{ FURNACE_COMMAND, "FURNACE_COMMAND", dgnKindCommand },
+	{ WATERHEATER_STATUS, "WATERHEATER_STATUS", dgnKindControl },
+	{ WATERHEATER_COMMAND, "WATERHEATER_COMMAND", dgnKindCommand },
+	{ WATER_PUMP_STATUS, "WATER_PUMP_STATUS", dgnKindControl },
+	{ WATER_PUMP_COMMAND, "WATER_PUMP_COMMAND", dgnKindCommand },
+	{ AWNING_STATUS, "AWNING_STATUS", dgnKindControl },
+	{ AWNING_STATUS_2, "AWNING_STATUS_2", dgnKindControl },
+	{ AWNING_COMMAND, "AWNING_COMMAND", dgnKindCommand },
+	{ SLIDE_STATUS, "SLIDE_STATUS", dgnKindControl },
+	{ SLIDE_COMMAND, "SLIDE_COMMAND", dgnKindCommand },
+	{ LEVELING_CONTROL_STATUS, "LEVELING_CONTROL_STATUS", dgnKindControl },
+	{ LEVELING_CONTROL_COMMAND, "LEVELING_CONTROL_COMMAND", dgnKindCommand },
+	{ GENERATOR_STATUS_1, "GENERATOR_STATUS_1", dgnKindStatus },
+	{ GENERATOR_COMMAND, "GENERATOR_COMMAND", dgnKindCommand },
+	{ GENERIC_CONFIGURATION_STATUS, "GENERIC_CONFIGURATION_STATUS", dgnKindStatus },
+	{ DC_SOURCE_STATUS_1, "DC_SOURCE_STATUS_1", dgnKindStatus },
+	{ BATTERY_STATUS, "BATTERY_STATUS (non-standard)", dgnKindStatus },
+	{ TANK_STATUS, "TANK_STATUS", dgnKindStatus },
+	{ DATE_TIME_STATUS, "DATE_TIME_STATUS", dgnKindStatus },
+	{ INVERTER_STATUS, "INVERTER_STATUS", dgnKindStatus },
+	{ INVERTER_AC_STATUS_1, "INVERTER_AC_STATUS_1", dgnKindStatus },
+	{ INVERTER_TEMPERATURE_STATUS, "INVERTER_TEMPERATURE_STATUS", dgnKindStatus },
+	{ CHARGER_AC_STATUS_1, "CHARGER_AC_STATUS_1", dgnKindStatus },
+	{ ATS_AC_STATUS_1, "ATS_AC_STATUS_1", dgnKindStatus },
+	{ ATS_AC_STATUS_3, "ATS_AC_STATUS_3", dgnKindStatus },
+	{ ATS_AC_STATUS_4, "ATS_AC_STATUS_4", dgnKindStatus },
+	{ ATS_STATUS, "ATS_STATUS", dgnKindStatus },
+	{ DM_RV, "DM_RV", dgnKindStatus },
+	{ PRODUCT_ID, "PRODUCT_ID", dgnKindStatus },
+	{ ACKNOWLEDGMENT, "ACKNOWLEDGMENT", dgnKindStatus },
+	{ REQUEST_FOR_DGN, "REQUEST_FOR_DGN", dgnKindStatus },
+	{ ADDRESS_CLAIMED, "ADDRESS_CLAIMED", dgnKindStatus },
+};
+
+const DGNInfo* findDGNInfo(uint32_t dgn) {
+	for (const DGNInfo &info : dgnInfoList) {
+		if (info.dgn == dgn) {
+			return &info;
+		}
+	}
+	return NULL;
+}
+
+typedef struct {
+	uint32_t dgn;				// PDU1 destination address stripped
+	uint32_t count;
+	uint32_t changes;
+	uint32_t lastReportMS;
+	uint8_t source;
+	uint8_t instance;			// data byte 0 - the instance for nearly every RV-C status/command
+	uint8_t dlc;
+	uint8_t data[8];
+} CensusEntry;
+
+enum {
+	monitorOff = 0,
+	monitorControls,			// control status changes and commands
+	monitorUnknown,				// ...plus changes in DGNs this code has no name for
+	monitorAll					// ...plus every other change
+};
+
+constexpr uint16_t maxCensusEntries = 320;
+constexpr uint32_t monitorMinReportIntervalMS = 1000;	// per entry, for the chattier monitor levels
+
+CensusEntry census[maxCensusEntries];
+uint16_t censusCount = 0;
+uint32_t censusOverflow = 0;
+uint32_t sourceSeenBits[8] = { 0 };
+uint32_t rxQueueFullCount = 0;
+bool addressConflict = false;
+uint8_t monitorMode = monitorOff;
+
+void printPacketData(const uint8_t* data, uint8_t dlc) {
+	for (auto i=0; i<dlc; i++) {
+		printf("%02X ", data[i]);
+	}
+}
+
+void printMonitorLine(const char* tag, const CensusEntry* entry, const DGNInfo* info, const uint8_t* oldData) {
+	printf("%u: [%s] %05X %s src=%d inst=%d: ", (uint32_t)millis(), tag, entry->dgn, (info) ? info->name : "(unnamed)", entry->source, entry->instance);
+	printPacketData(entry->data, entry->dlc);
+	if (oldData) {
+		printf(" was: ");
+		printPacketData(oldData, entry->dlc);
+	}
+	if (entry->dgn == DC_DIMMER_STATUS_3 && entry->dlc >= 3 && entry->data[2] <= RVCPercentMax) {
+		printf(" level=%d%%", min(entry->data[2], RVCBrightMax) / 2);
+	}
+	printf("\n");
+}
+
+// PRODUCT_ID replies are longer than one frame and arrive as an INITIAL_PACKET followed by
+// DATA_PACKETs. Only as much reassembly as it takes to print them.
+typedef struct {
+	bool active;
+	uint8_t source;
+	uint16_t length;
+	char text[80];
+} ProductIDSession;
+
+constexpr uint8_t maxProductIDSessions = 4;
+ProductIDSession productIDSessions[maxProductIDSessions];
+
+void printProductID(uint8_t source, const char* text, uint16_t length) {
+	printf("%u: Product ID src=%d (0x%02X): \"", (uint32_t)millis(), source, source);
+	for (auto i=0; i<length; i++) {
+		char c = text[i];
+		if (c == 0 || (uint8_t)c == 0xFF) {
+			break;
+		}
+		printf("%c", (c >= 32 && c < 127) ? c : '.');
+	}
+	printf("\"\n");
+}
+
+void handleProductIDPackets(uint32_t dgn, uint8_t source, const uint8_t* d, uint8_t dlc) {
+	if (dgn == PRODUCT_ID) {
+		printProductID(source, (const char*)d, dlc);
+	}
+	else if (dgn == TP_INITIAL_PACKET && dlc == 8) {
+		uint32_t carriedDGN = d[5] | (d[6] << 8) | ((uint32_t)(d[7] & 0x01) << 16);
+
+		if (carriedDGN == PRODUCT_ID) {
+			ProductIDSession* session = &productIDSessions[0];
+
+			for (ProductIDSession &candidate : productIDSessions) {
+				if (!candidate.active || candidate.source == source) {
+					session = &candidate;
+					break;
+				}
+			}
+			session->active = true;
+			session->source = source;
+			session->length = min((uint16_t)(d[1] | (d[2] << 8)), (uint16_t)sizeof(session->text));
+			memset(session->text, 0, sizeof(session->text));
+		}
+	}
+	else if (dgn == TP_DATA_PACKET && dlc >= 2 && d[0] >= 1) {
+		for (ProductIDSession &session : productIDSessions) {
+			if (session.active && session.source == source) {
+				uint16_t offset = (d[0] - 1) * 7;
+
+				for (auto i=1; i<dlc && offset < session.length; i++) {
+					session.text[offset++] = d[i];
+				}
+				if (offset >= session.length) {
+					printProductID(source, session.text, session.length);
+					session.active = false;
+				}
+				break;
+			}
+		}
+	}
+}
+
+void censusRecord(CAN_frame_t *packet) {
+	if (packet->FIR.B.RTR == CAN_RTR || packet->FIR.B.FF != CAN_frame_ext) {
+		return;
+	}
+
+	uint32_t dgn = dgnBase(getMsgBits(packet->MsgID, 24, 17));
+	uint8_t source = getMsgBits(packet->MsgID, 7, 8);
+	uint8_t dlc = min((uint8_t)packet->FIR.B.DLC, (uint8_t)8);
+	const uint8_t* d = packet->data.u8;
+
+	sourceSeenBits[source >> 5] |= 1UL << (source & 31);
+
+	if (source == sourceAddress && !addressConflict) {
+		addressConflict = true;
+		printf("%u: *** WARNING: another device on the bus is using source address %d. Change sourceAddress in config.h! ***\n", (uint32_t)millis(), sourceAddress);
+	}
+
+	if (dgn == PRODUCT_ID || dgn == TP_INITIAL_PACKET || dgn == TP_DATA_PACKET) {
+		handleProductIDPackets(dgn, source, d, dlc);
+		if (dgn != PRODUCT_ID) {
+			return;				// byte 0 of a transport packet is not an instance
+		}
+	}
+
+	const DGNInfo* info = findDGNInfo(dgn);
+	DGNKind kind = (info) ? info->kind : dgnKindStatus;
+	uint8_t instance = (dlc > 0) ? d[0] : 0xFF;
+	uint32_t now = millis();
+
+	bool wanted = (monitorMode == monitorAll) ||
+				  (monitorMode >= monitorControls && kind != dgnKindStatus) ||
+				  (monitorMode >= monitorUnknown && info == NULL);
+
+	for (auto i=0; i<censusCount; i++) {
+		CensusEntry* entry = &census[i];
+
+		if (entry->dgn == dgn && entry->source == source && entry->instance == instance) {
+			bool changed = entry->dlc != dlc || memcmp(entry->data, d, dlc) != 0;
+			uint8_t oldData[8];
+
+			entry->count++;
+			if (changed) {
+				memcpy(oldData, entry->data, sizeof(oldData));
+				memcpy(entry->data, d, dlc);
+				entry->dlc = dlc;
+				entry->changes++;
+			}
+
+			// Commands are events: two presses of a "toggle" button are identical frames.
+			if (wanted && (changed || kind == dgnKindCommand)) {
+				if (kind != dgnKindStatus || (now - entry->lastReportMS) >= monitorMinReportIntervalMS) {
+					printMonitorLine((kind == dgnKindCommand) ? "CMD" : "CHG", entry, info, (changed) ? oldData : NULL);
+					entry->lastReportMS = now;
+				}
+			}
+			return;
+		}
+	}
+
+	if (censusCount >= maxCensusEntries) {
+		censusOverflow++;
+		return;
+	}
+
+	CensusEntry* entry = &census[censusCount++];
+
+	memset(entry, 0, sizeof(CensusEntry));
+	entry->dgn = dgn;
+	entry->source = source;
+	entry->instance = instance;
+	entry->dlc = dlc;
+	entry->count = 1;
+	entry->lastReportMS = now;
+	memcpy(entry->data, d, dlc);
+
+	if (wanted) {
+		printMonitorLine((kind == dgnKindCommand) ? "CMD" : "NEW", entry, info, NULL);
+	}
+}
+
+void cmdCensus(const char *buff) {
+	static uint16_t order[maxCensusEntries];
+
+	for (auto i=0; i<censusCount; i++) {		// insertion sort by dgn, instance, source
+		CensusEntry* entry = &census[i];
+		int16_t j = i - 1;
+
+		while (j >= 0) {
+			CensusEntry* other = &census[order[j]];
+			bool after = (other->dgn != entry->dgn) ? (other->dgn > entry->dgn) :
+						 (other->instance != entry->instance) ? (other->instance > entry->instance) : (other->source > entry->source);
+			if (!after) {
+				break;
+			}
+			order[j + 1] = order[j];
+			j--;
+		}
+		order[j + 1] = i;
+	}
+
+	printf("\nDGN    Name                          Inst  Src   Count Changes  Last data\n");
+	for (auto i=0; i<censusCount; i++) {
+		CensusEntry* entry = &census[order[i]];
+		const DGNInfo* info = findDGNInfo(entry->dgn);
+
+		printf("%05X  %-28s  %4d  %3d  %6u  %6u  ", entry->dgn, (info) ? info->name : "(unnamed)", entry->instance, entry->source, entry->count, entry->changes);
+		printPacketData(entry->data, entry->dlc);
+		printf("\n");
+	}
+
+	printf("\n%d entries", censusCount);
+	if (censusOverflow) {
+		printf(" (table full: %u packets not recorded)", censusOverflow);
+	}
+	printf(". Source addresses seen:");
+	for (auto source=0; source<256; source++) {
+		if (sourceSeenBits[source >> 5] & (1UL << (source & 31))) {
+			printf(" %d", source);
+		}
+	}
+	printf("\nReceive queue found full %u times (packets were probably lost each time).\n", rxQueueFullCount);
+	if (addressConflict) {
+		printf("*** Another device is using our source address %d - change sourceAddress in config.h ***\n", sourceAddress);
+	}
+	printf("\n");
+}
+
+void cmdCensusClear(const char *buff) {
+	censusCount = 0;
+	censusOverflow = 0;
+	rxQueueFullCount = 0;
+	memset(sourceSeenBits, 0, sizeof(sourceSeenBits));
+	printf("%u: Census cleared.\n", (uint32_t)millis());
+}
+
+void cmdSetMonitor(const char *buff) {
+	const char* labels[] = { "Off", "Controls and commands", "Controls, commands and unnamed DGNs", "Everything" };
+
+	buff++;
+	while (buff[0]==' ') buff++;
+
+	if (buff[0] >= '0' && buff[0] <= '3') {
+		monitorMode = buff[0] - '0';
+		printf("%u: Change monitor: %s.\n", (uint32_t)millis(), labels[monitorMode]);
+	}
+	else {
+		printf("%u: cmdSetMonitor: parameter error!\n", (uint32_t)millis());
+	}
+}
+
+// Ask every device that has been heard to identify itself (make*model*serial*unit).
+// PRODUCT_ID may not be requested globally, so each address is asked in turn.
+void cmdIdentify(const char *buff) {
+	uint16_t requests = 0;
+
+	for (auto dest=0; dest<254; dest++) {
+		if (dest != sourceAddress && (sourceSeenBits[dest >> 5] & (1UL << (dest & 31)))) {
+			CAN_frame_t packet;
+			initPacket(&packet, PRODUCT_ID & 0xFF, REQUEST_FOR_DGN | dest);
+			packet.data.u8[1] = (PRODUCT_ID >> 8) & 0xFF;
+			packet.data.u8[2] = (PRODUCT_ID >> 16) & 0xFF;
+			queuePacket(&packet);
+			requests++;
+		}
+	}
+	printf("%u: Requested Product ID from %d devices%s.\n", (uint32_t)millis(), requests, (doCANWrite) ? "" : " - but CAN-Bus writes are disabled, see '@w'");
 }
 
 //////////////////////////////////////////////
@@ -1156,7 +1670,7 @@ void cmdSet(const char *buff, uint8_t multiplier, const char* label) {
 	while (buff) {
 		buff = getValuePair(buff, &index, &val);
 
-		if (index!=-1 && val!=-1) {
+		if (index>=0 && index<=RVCInstanceMax && val>=0 && val*multiplier<=RVCPercentMax) {
 			printf("%u: %s: index=%d, val=%d\n", (uint32_t)millis(), label, index, val);
 			setSwitchLevel(index, val*multiplier);
 		}
@@ -1215,7 +1729,7 @@ void cmsSetThermostat(const char *buff) {
 		fanSpeed = 0;
 	}
 
-	if (index!=-1 && opMode!=-1 && fanMode!=-1 && fanSpeed!=-1 && tempF!=-1) {
+	if (index>=0 && index<=RVCInstanceMax && opMode>=0 && opMode<=ThermostatModeNA && fanMode>=0 && fanMode<=FanModeNA && fanSpeed>=0 && fanSpeed<=255 && tempF!=-1) {
 		double tempC = (tempF - 32.0) / 1.8;
 		printf("%u: cmsSetThermostat: index=%d, mode=%d, temp=%dºF (%0.1fºC), fanMode=%d, fanSpeed=%d\n", (uint32_t)millis(), index, opMode, tempF, tempC, fanMode, fanSpeed);
 		setThermostatInfo(index, (ThermostatMode)opMode, (FanMode)fanMode, fanSpeed, tempC, tempC);
@@ -1234,7 +1748,7 @@ void cmdSendOnOff(const char *buff) {
 	while (buff) {
 		buff = getValuePair(buff, &index, &val);
 
-		if (index!=-1 && val!=-1) {
+		if (index>=0 && index<=RVCInstanceMax && (val==0 || val==1)) {
 			printf("%u: cmdSendOnOff: index=%d, val=%d\n", (uint32_t)millis(), index, val);
 			sendOnOff(index, val);
 		}
@@ -1260,6 +1774,16 @@ void cmdSetCANWrite(const char *buff) {
 		default:
 			printf("%u: cmdSetCANWrite: parameter error!\n", (uint32_t)millis());
 	}
+}
+
+bool awningDebug = false;
+
+void cmdSetAwningDebug(const char *buff) {
+	buff++;
+	while (buff[0]==' ') buff++;
+
+	awningDebug = (buff[0] == '1');
+	printf("%u: Awning packet debug: %s.\n", (uint32_t)millis(), (awningDebug) ? "On" : "Off");
 }
 
 void cmdSetPacketLog(const char *buff) {
@@ -1289,13 +1813,18 @@ void cmdSetPacketLog(const char *buff) {
 }
 
 void addCommands() {
-	new SpanUserCommand('l',"<index>=<level:0-250>,... - set level of <index>", cmdSetLevel);
+	new SpanUserCommand('l',"<index>=<level:0-200>,... - set level of <index>", cmdSetLevel);
 	new SpanUserCommand('s',"<index>=<state:0-1>,... - set state of <index>", cmdSetState);
 	new SpanUserCommand('o',"<index>=<state:0-1>,... - send onOff to <index>", cmdSendOnOff);
 	new SpanUserCommand('a',"<index>=<tempºF>,... - set ambient temp of <index>", cmdSetAmbient);
-	new SpanUserCommand('w',"<0-1>,... - set CAN-Bus write enable", cmdSetCANWrite);
-	new SpanUserCommand('p',"<0-2>,... - set packet logging: 0=No, 1=Yes, 2=If unknown, 3=If known", cmdSetPacketLog);
-	new SpanUserCommand('t',"<index>=<mode:0-2>,<tempºF>,optional(<fanmode:0-1>,<fanspeed:0-250>) - set info for thermostat <index>", cmsSetThermostat);
+	new SpanUserCommand('w',"<0-1> - set CAN-Bus write enable", cmdSetCANWrite);
+	new SpanUserCommand('p',"<0-3> - set packet logging: 0=No, 1=Yes, 2=If unknown, 3=If known", cmdSetPacketLog);
+	new SpanUserCommand('t',"<index>=<mode:0-2>,<tempºF>,optional(<fanmode:0-1>,<fanspeed:0-200>) - set info for thermostat <index>", cmsSetThermostat);
+	new SpanUserCommand('c',"- print the census of every DGN/instance/source address seen on the bus", cmdCensus);
+	new SpanUserCommand('x',"- clear the census", cmdCensusClear);
+	new SpanUserCommand('m',"<0-3> - monitor bus changes: 0=Off, 1=Controls+commands, 2=...+unnamed DGNs, 3=Everything", cmdSetMonitor);
+	new SpanUserCommand('i',"- ask every device heard on the bus for its Product ID", cmdIdentify);
+	new SpanUserCommand('d',"<0-1> - awning packet debug output", cmdSetAwningDebug);
 }
 
 //////////////////////////////////////////////
@@ -1386,13 +1915,19 @@ void setup() {
 	// Reduce processor frequency to lower current consumption
 	setCpuFrequencyMhz(160);
 
+	#ifdef RV_DEFINITION_UNVERIFIED
+		printf("%u: *** This RV definition is unverified: CAN-Bus writes are OFF. Use '@m 1' and '@c' to find the\n", (uint32_t)millis());
+		printf("%u: *** real instance numbers (docs/DISCOVERY.md), then '@w 1' to enable writes. ***\n", (uint32_t)millis());
+	#endif
+
 	printf("%u: Init complete.\n", (uint32_t)millis());
 }
 
 //////////////////////////////////////////////
 
 void processPacket(CAN_frame_t *packet) {
-	if (packet->FIR.B.RTR != CAN_RTR) {
+	// every RV-C message handled here is a full 8 byte extended frame
+	if (packet->FIR.B.RTR != CAN_RTR && packet->FIR.B.FF == CAN_frame_ext && packet->FIR.B.DLC >= 8) {
 		uint32_t dgn = getMsgBits(packet->MsgID, 24, 17);
 		// uint8_t sourceAddr = getMsgBits(packet->MsgID, 7, 8);
 		// uint8_t priority = getMsgBits(packet->MsgID, 28, 3);
@@ -1430,11 +1965,17 @@ void processPacket(CAN_frame_t *packet) {
 			
 			setThermostatInfo(instance, opMode, fanMode, fanSpeed, heatTemp, coolTemp);
 		}
-		else if (dgn == BATTERY_STATUS) {
+		else if (dgn == BATTERY_STATUS || dgn == DC_SOURCE_STATUS_1) {
 			uint8_t instance = d[0];
 			uint16_t v_int = d[3]<<8 | d[2];
-			float voltage = v_int * 0.050;
-			setBatteryVoltage(instance, voltage);		
+
+			if (v_int < 0xFFFD) {
+				float voltage = v_int * 0.050;
+				// The proprietary message outranks any DC_SOURCE_STATUS_1 (device priority in byte 1)
+				uint8_t priority = (dgn == BATTERY_STATUS) ? 0xFF : min(d[1], (uint8_t)0xFE);
+
+				setBatteryVoltage(instance, voltage, priority);
+			}
 		}
 	}
 }
@@ -1534,6 +2075,7 @@ void displayPacket(CAN_frame_t *packet, uint8_t printPacket) {
 			printf("%u: AWNING_COMMAND: inst=%d, dir=%d, pos=%d, retract=%d\n", (uint32_t)millis(), instance, direction, position, retract);			
 		}
 		else if (dgn == AIR_CONDITIONER_STATUS) { }
+		else if (dgn == AIR_CONDITIONER_COMMAND) { }
 		else if (dgn == AWNING_STATUS) { }
 		else if (dgn == AWNING_STATUS_2) { }
 		else if (dgn == DATE_TIME_STATUS) { }
@@ -1681,11 +2223,19 @@ void loop() {
 
 	CAN_frame_t packet;
 
-	if (xQueueReceive(CAN_cfg.rx_queue, &packet, 0) == pdTRUE) {
+	if (uxQueueMessagesWaiting(CAN_cfg.rx_queue) >= receiveQueueSize) {
+		rxQueueFullCount++;
+	}
+
+	// Drain the queue: one packet per pass falls behind whenever homeSpan.poll() is busy
+	for (auto i=0; i<maxPacketsPerLoop && xQueueReceive(CAN_cfg.rx_queue, &packet, 0) == pdTRUE; i++) {
 		if (packetPrintMode != packetPrintNo) {
 			displayPacket(&packet, packetPrintMode);
 		}
-		debugPacket(&packet);
+		if (awningDebug) {
+			debugPacket(&packet);
+		}
+		censusRecord(&packet);
 		processPacket(&packet);
 	}
 
